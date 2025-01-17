@@ -1,0 +1,449 @@
+﻿// @ Author - Donatas Kanapickas.
+// Volumetric Fog voxel based solution originally described by Bwronski in 2014 siggraph paper.
+
+#define RADIAN					0.0174533
+#define PI						3.14159265359
+#define EPSILON                 0.00001f
+
+// ------------------------------------------- Buffers ----------------------------------------------------------- //
+
+RWTexture3D<float4> 			_SMediaMap;
+
+
+Texture3D<float4>              _PMVolume;
+Texture3D<float>               _PMRadiance;
+
+//Texture3D<float> _NoiseLUT;
+//SamplerState sampler_NoiseLUT;
+
+//Texture3D<float4>               _VolumeInjectionMap;
+//Texture3D<float>				_ParticipatingMediumMap;
+//SamplerState					sampler_ParticipatingMediumMap;
+
+//Texture3D<float>                _RadianceMap;
+
+
+
+struct DEPTH_STEPS
+{
+    float Step;
+};
+
+StructuredBuffer<DEPTH_STEPS> _DepthData;
+ 
+ 
+// ------------------------------------------- Uniforms ----------------------------------------------------------- //
+
+uniform float4		_LSPN;
+uniform float4		_LSPF;
+
+uniform float		_HeightTop;
+uniform float		_HeightBottom;
+
+uniform float		_DensityBottom;
+uniform float		_DensityTop;
+
+uniform float       _DensityNear;
+uniform float       _DensityFar;
+
+uniform float		_Density;
+uniform float		_NoiseSize;
+uniform float3		_WindVelocity;
+
+uniform float4		_AmbientColor;
+uniform float4		_AtmosphereColor;
+uniform float4      _AtmosphereBackColor;
+uniform float4		_CloudsColor;
+uniform float4		_ShadowColor;
+
+uniform int			_PointLightCount;
+uniform int			_SpotLightCount;
+
+
+uniform float		_CameraNear;
+uniform	float		_CameraFar;
+uniform bool		_EnableNoise;
+uniform float		_Shadow;
+
+uniform float		_Scattering;
+uniform float		_Absorption;
+
+uniform float3		_SunColor;
+uniform float3		_SunDirection;
+uniform float		_SunIntensity;
+  
+uniform float		_SunAnistropy;
+uniform float		_AtmosphereAnistropy;
+
+uniform float		_RadialLobe;
+uniform float		_RadialBlend;
+
+uniform float		_DensityInfluence;
+
+uniform int			_SuperSampling;
+uniform float		_ShadowFadeDistance;
+uniform bool		_NoiseOcclusion;
+uniform float		_OcclusionStrength;
+
+uniform float3		_CameraPosition;
+uniform float3		_CameraUp;
+uniform float3		_CameraRight;
+uniform float3		_CameraFront;
+uniform float		_CameraAspect;
+uniform float		_CameraFOV;
+
+uniform float		_RampStart;
+uniform float		_RampEnd;
+uniform float       _RampStartDensity;
+uniform float       _RampEndDensity;
+
+uniform float		_RampInfluence;
+
+uniform float		_NoiseInfluence;
+
+uniform bool		_Noise;
+
+
+uniform bool        _RenderVolumesAndLights;
+
+
+uniform float		_DirectStrength;
+uniform float       _OcclusionBlend;
+
+uniform float       _NoiseFadeBottomHeight;
+uniform float       _NoiseFadeTopHeight;
+
+uniform float       _NoiseHeightBottom;
+uniform float       _NoiseHeightTop;
+uniform float       _NoiseInfluenceBottom;
+uniform float       _NoiseInfluenceTop;
+
+uniform float3      _NoiseFrequency;
+uniform float3      _NoiseFrequencyRandom;
+
+uniform int         _FogVolumeMode;
+uniform float       _FogVolumeBlend;
+
+uniform int         _CloudsFillMode;
+
+uniform int         _DensityMode;
+
+uniform float       _Exposure;
+
+uniform float3      _VolumeResolution;
+
+
+// ---------------------------------------------- Phase Functions ----------------------------------------------------------- //
+
+// Henyey-Greenstein phase function
+// @ dotLE	- light to eye dot product
+// @ g		- anistropy parameter
+float HenyeyGreensteinPhase(float dotLE, float g)
+{
+	const float g2 = 1.0 - g * g;
+	float h = (1.0f + (g * g) - (2 * g * dotLE));
+	return (g2 / (4.0f * PI * pow(max(0.0, h), 1.5f)));
+}
+
+float SchlickPhaseFunction(float dotLE, float k)
+{
+	const float k2 = 1.0 - k * k;
+	float h = -((k * dotLE) - 1.0f);
+	return (k2 / (4.0f * PI * h * h));
+}
+
+float ReyLeighPhaseFunction(float3 ray)
+{
+    float fCos = dot(_SunDirection, ray) / length(ray);
+    float fCos2 = fCos * fCos;
+    return 0.75f + 0.75f * fCos2;
+}
+
+float RadialPhaseFunction(float dotLE)
+{
+    float factor = (1.0f - abs(dotLE));
+    return (factor * (1.0f / (PI * PI)));
+}
+
+// Beer-Lambert inscatter equation.
+// @ front	- front voxel value
+// @ back	- back voxel value
+float4 Inscatter(float4 front, float4 back)
+{
+    float3 light = front.rgb + saturate(exp(-front.a)) * back.rgb;
+	return float4(light, front.a + back.a);
+}
+
+
+// ---------------------------------------------- Core Functions ----------------------------------------------------------- //
+
+// height attenuation
+// TODO: optimize - remove branches.
+// @ position - world space position
+float computeHeightAttenuation(float3 position, float heightBottom, float heightTop, float densityTop, float densityBottom)
+{
+	if (position.y >= heightBottom && position.y < heightTop)
+	{
+		float diff = heightTop - heightBottom;
+		float coeff = (position.y - heightBottom) / diff;
+
+		return lerp(densityBottom, densityTop, coeff);
+	}
+
+	return 0;
+}
+
+
+//
+//
+//
+float computeRampThickness(float depth, float rampStart, float rampEnd)
+{
+	if (depth <= rampStart)
+		return 0;
+
+	if (depth >= rampEnd)
+		return 1;
+
+	float totalLength	= rampEnd - rampStart;
+	float pDepth		= depth - rampStart;
+	float coeff			= pDepth / totalLength;
+
+    return lerp(coeff * _RampStartDensity, coeff * _RampEndDensity, coeff);
+}
+
+
+//
+//
+//
+void computeRadialColor(float3 ray, out float3 sun, out float3 ambient)
+{
+	float	dotLE		= dot(_SunDirection, -normalize(ray));
+	float	sunRadial	= HenyeyGreensteinPhase(dotLE, _SunAnistropy);		// calculate sun phase
+	float	phase1		= SchlickPhaseFunction(dotLE, _AtmosphereAnistropy);		// calculate atmosphere phase
+    float   phase2      = RadialPhaseFunction(dotLE);
+
+	float	atmoRadial	= lerp(phase2, phase1, _RadialLobe);
+
+	float	blendedPhase    = lerp(atmoRadial, sunRadial, _RadialBlend);  // blend phase coeffs
+    float3  blendedColor    = lerp(atmoRadial * _AtmosphereColor.rgb, sunRadial * _SunColor, _RadialBlend); // blend sun with atmosphere
+
+	sun			= saturate(blendedColor * _SunIntensity);
+	ambient		= saturate(_AmbientColor.rgb * ((1 - saturate(blendedPhase)) * 0.5f) * _SunIntensity);			// sun opposite = fog color
+}
+
+// Computes sun, atmosphere & ambient lightning.
+float3 computeShading(float radiance, float layerThickness, float layerThicknessO, float3 sunColor, float3 ambientColor, float attenuation, float density)
+{
+    float3 sunRadiance = radiance * sunColor;
+    float3 shadowRadiance = (1.0f - radiance) * _ShadowColor.rgb;
+    float3 ambientRadiance = radiance * ambientColor;
+
+    float3 ambient = (shadowRadiance + ambientRadiance) * layerThickness * density * attenuation;
+    float3 sun = lerp(sunRadiance * layerThicknessO * attenuation, sunRadiance * layerThickness * attenuation, _DensityInfluence) * density;
+
+    return ambient + sun;
+}
+
+//
+//
+//
+void computeCloudsAttenuation(float3 worldPos, inout float density, inout float density2, inout float noiseFadeLerp)
+{
+    if (worldPos.y < _NoiseHeightTop && worldPos.y > _NoiseHeightBottom)
+    {
+         // interpolate densities.
+        float densityBottom = lerp(0.5f, density, _NoiseInfluenceBottom);
+        float densityTop = lerp(0.5f, density, _NoiseInfluenceTop);
+
+        float densityBottom2 = lerp(0.5f, density2, _NoiseInfluenceBottom);
+        float densityTop2 = lerp(0.5f, density2, _NoiseInfluenceTop);
+
+        float length = _NoiseHeightTop - _NoiseHeightBottom;
+        float coeff = (worldPos.y - _NoiseHeightBottom) / length;
+
+        density = lerp(densityBottom, densityTop, coeff);
+        density2 = lerp(densityBottom2, densityTop2, coeff);
+
+        // fade bottom
+        if (worldPos.y > _NoiseHeightBottom && worldPos.y < _NoiseHeightBottom + _NoiseFadeBottomHeight)
+        {
+            float position = worldPos.y - _NoiseHeightBottom;
+            position /= _NoiseFadeBottomHeight;
+
+            density = lerp(0.5f, density, position); 
+            density2 = lerp(0.5f, density2, position);
+
+            noiseFadeLerp = position;
+        }
+
+        // fade top
+        else if (worldPos.y < _NoiseHeightTop && worldPos.y > _NoiseHeightTop - _NoiseFadeTopHeight)
+        {
+            float position = _NoiseHeightTop - worldPos.y;
+            position /= _NoiseFadeTopHeight;
+
+            density = lerp(density, 0.5f, 1.0f - position);
+            density2 = lerp(density2, 0.5f, 1.0f - position);
+
+            noiseFadeLerp = position;
+        }
+    }
+    else
+    {
+        density = 0.5f;
+        density2 = 0.5f;
+    }
+}
+
+
+//
+//
+//
+void ComputeCloudsOcclusion(float3 animatedPos, float density, float density2, float noiseFadeLerp, inout float cloudOcclusion, inout float cloudScatter )
+{
+    // how much density to contribute.
+    float dContribution = density2 - density;
+
+    if (dContribution > 0)
+    {
+        // blend in negative value.
+        float blend = _OcclusionBlend * 0.5;
+        if (dContribution < blend)
+            dContribution = 0;
+        else if (dContribution < 0.5f)
+            dContribution = lerp(0.0f, 0.5f, (dContribution - blend) / (0.5f - blend));
+
+        // add cloud occlusion.
+        cloudOcclusion = _OcclusionStrength * density * dContribution * noiseFadeLerp;
+    }
+    else
+    {
+        // add clouds out scatter. 
+        cloudScatter = _DirectStrength * density * (dContribution * -1) * noiseFadeLerp;
+    }
+}
+
+//
+//
+//
+/*void computeLightsAndVolumes(inout float4 lightsAndVolumes, float3 spos, inout float density, inout float density2 )
+{
+    if (_RenderVolumesAndLights)
+    {
+        float4 vcMap = _VolumeInjectionMap[spos];
+
+        lightsAndVolumes.rgb = vcMap.rgb;
+        lightsAndVolumes.a = vcMap.a;
+
+        switch (_FogVolumeMode)
+        {
+            case 1: // cut out
+                density *= (1.0f - lightsAndVolumes.a);
+                break;
+            case 2: // fill
+                density = lerp(density, density * lightsAndVolumes.a, _FogVolumeBlend);
+                break;
+            case 3: // additive
+                density += lightsAndVolumes.a;
+                break; 
+        }
+    }
+}*/
+
+//
+//
+//
+float3 computeCameraRay(uint3 id, inout float3 nearPos, inout float3 farPos)
+{
+	// calculate texel
+    const float2 texel = id.xy / _VolumeResolution.xy;
+
+	// calculate camera ray
+	float2 uv = (texel - 0.5f) * _CameraFOV;
+	uv.x *= _CameraAspect;
+	float3 ray = _CameraUp * uv.y + _CameraRight * uv.x + _CameraFront;
+
+    // calculate near & far
+    farPos = _CameraPosition + ray * _CameraNear + ray * (_CameraFar - _CameraNear);
+    nearPos = _CameraPosition + ray * _CameraNear;
+
+    ray = farPos - nearPos;
+     
+    return ray;
+}
+
+
+// ------------------------------------------- Volumetric Fog Compute Shader ----------------------------------------------------------- //
+
+#pragma kernel VolumeInscatter
+[numthreads(8, 8, 1)]
+void VolumeInscatter(uint3 id : SV_DispatchThreadID)
+{
+	// get camera ray.
+    float3 farPos, nearPos = 0;
+	float3 ray = computeCameraRay(id, nearPos, farPos);
+
+	// ---------------------------------------- LOOP THROUGH DEPTH SLICES ----------------------------------------------- //
+	float	previousDepth	= 0;
+	float4  previousVoxel	= 0;
+	float3	previousPos		= 0;
+
+	// calculate sun & ambient phase colors based on camera ray.
+    float3 sunColor         = 0;
+    float3 ambientColor     = 0;
+    computeRadialColor(ray, sunColor, ambientColor);
+
+	// for each volume slice accumulate lightning
+	for (int i = 0; i < _VolumeResolution.z; i++)
+    {
+        const float depth               = _DepthData[i].Step; // step volume depth
+        const float ramp                = computeRampThickness(depth, _RampStart, _RampEnd) - computeRampThickness(previousDepth, _RampStart, _RampEnd);
+        const float layerThicknessO     = depth - previousDepth;
+        const float layerThickness      = lerp(layerThicknessO, ramp, _RampInfluence); // calculate lit layer thickness			
+        const float distMultiplier      = length(ray * layerThicknessO);
+        const float3 currentPos         = nearPos + ray * depth; // increment current position
+        const float3 spos               = float3(id.xy, i); // volume position
+
+
+        float heightAttenuation = 0;
+
+		// calculate step
+        float   stepThickness       = layerThickness;
+        float3  worldStepPosition   = currentPos + ray * stepThickness;
+        float   depthStepPosition   = depth + stepThickness;
+
+		// compute height densities.
+        heightAttenuation += computeHeightAttenuation(worldStepPosition, _HeightBottom, _HeightTop, _DensityTop, _DensityBottom);
+
+
+
+
+        // sample participating medium volumes
+        float4  PMVolume        = _PMVolume[uint3(id.xy, i)];
+        float   PMRadiance      = _PMRadiance[uint3(id.xy, i)];
+
+
+        // compute radial sun light.
+        float3  dirlight         = saturate( computeShading(PMRadiance, 1, 1, sunColor, ambientColor, 1, 1) );
+
+        // combine densities
+        float   attenDensity     =  _Density * layerThickness * heightAttenuation;
+
+        // combine scattering & absorption
+        float3  scattering       = (_Scattering * (PMVolume.rgb * 4.0f + dirlight)) * attenDensity;
+        float   absorption       = (_Absorption + PMVolume.w * 4.0f) * attenDensity;
+        float4  voxel            = saturate( float4(scattering, absorption) * distMultiplier );
+
+        // beer lambert inscatter.
+        voxel   = Inscatter(previousVoxel, voxel);
+
+		// store
+        _SMediaMap[spos]        = float4(voxel.rgb, exp(-voxel.a));
+
+        previousVoxel           = voxel;
+		previousPos				= currentPos;
+		previousDepth			= depth; 
+	}
+}
+ 

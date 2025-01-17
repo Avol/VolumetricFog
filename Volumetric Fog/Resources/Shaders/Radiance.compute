@@ -1,0 +1,483 @@
+﻿#pragma kernel VolumeRadiance
+
+#define EXPONENT 2.718
+
+Texture2D<float>    _DirectionalShadow;
+Texture2D<float4>   _ShadowProjMatrices;
+Texture2D<float4>   _ShadowSplitSpheres;
+
+RWTexture3D<half>  _RadianceMap;
+
+uniform float       _Shadow;
+uniform float2      _ShadowResolution;
+uniform float3      _VolumeResolution;
+uniform float       _DepthOffset;
+
+uniform float4      _LSPN;
+uniform float4      _LSPF;
+
+uniform float3      _CameraPosition;
+uniform float3      _CameraUp;
+uniform float3      _CameraRight;
+uniform float3      _CameraFront;
+uniform float       _CameraAspect;
+uniform float       _CameraFOV;
+
+uniform float       _CameraNear;
+uniform float       _CameraFar;
+
+uniform float       _RampStart;
+uniform float       _RampEnd;
+uniform float       _RampInfluence;
+
+uniform int         _SuperSampling;
+uniform int         _TSSAAFrame;
+uniform int         _TemporalFilter;
+
+uniform int         _CascadeCount;
+uniform float       _CameraVP;
+
+uniform float       _RenderDistance;
+uniform float       _PV;
+
+
+struct DEPTH_STEPS
+{
+    float Step;
+};
+
+StructuredBuffer<DEPTH_STEPS> _DepthData;
+
+uniform float       _DepthStepData[64];
+
+// ---------------------------------------------- Cascade Functions ----------------------------------------------------------- //
+
+// Extract directional light cascaded shadows matrices
+// Reads out of a texture data extracted from fragment shader.
+void extractShadowProjectionMatrices(inout float4x4 LPV0)
+{
+	LPV0[0] = _ShadowProjMatrices[uint2(0, 0)];
+	LPV0[1] = _ShadowProjMatrices[uint2(1, 0)];
+	LPV0[2] = _ShadowProjMatrices[uint2(2, 0)];
+	LPV0[3] = _ShadowProjMatrices[uint2(3, 0)];
+}
+
+// Extract directional light cascaded shadows matrices
+// Reads out of a texture data extracted from fragment shader.
+void extractShadowProjectionMatrices2(inout float4x4 LPV0, inout float4x4 LPV1)
+{
+	LPV0[0] = _ShadowProjMatrices[uint2(0, 0)];
+	LPV0[1] = _ShadowProjMatrices[uint2(1, 0)];
+	LPV0[2] = _ShadowProjMatrices[uint2(2, 0)];
+	LPV0[3] = _ShadowProjMatrices[uint2(3, 0)];
+
+	LPV1[0] = _ShadowProjMatrices[uint2(4, 0)];
+	LPV1[1] = _ShadowProjMatrices[uint2(5, 0)];
+	LPV1[2] = _ShadowProjMatrices[uint2(6, 0)];
+	LPV1[3] = _ShadowProjMatrices[uint2(7, 0)];
+}
+
+// Extract directional light cascaded shadows matrices
+// Reads out of a texture data extracted from fragment shader.
+void extractShadowProjectionMatrices4(inout float4x4 LPV0, inout float4x4 LPV1, inout float4x4 LPV2, inout float4x4 LPV3)
+{
+	LPV0[0] = _ShadowProjMatrices[uint2(0, 0)];
+	LPV0[1] = _ShadowProjMatrices[uint2(1, 0)];
+	LPV0[2] = _ShadowProjMatrices[uint2(2, 0)];
+	LPV0[3] = _ShadowProjMatrices[uint2(3, 0)];
+
+	LPV1[0] = _ShadowProjMatrices[uint2(4, 0)];
+	LPV1[1] = _ShadowProjMatrices[uint2(5, 0)];
+	LPV1[2] = _ShadowProjMatrices[uint2(6, 0)];
+	LPV1[3] = _ShadowProjMatrices[uint2(7, 0)];
+
+	LPV2[0] = _ShadowProjMatrices[uint2(8, 0)];
+	LPV2[1] = _ShadowProjMatrices[uint2(9, 0)];
+	LPV2[2] = _ShadowProjMatrices[uint2(10, 0)];
+	LPV2[3] = _ShadowProjMatrices[uint2(11, 0)];
+
+	LPV3[0] = _ShadowProjMatrices[uint2(12, 0)];
+	LPV3[1] = _ShadowProjMatrices[uint2(13, 0)];
+	LPV3[2] = _ShadowProjMatrices[uint2(14, 0)];
+	LPV3[3] = _ShadowProjMatrices[uint2(15, 0)];
+}
+
+// Computes directional light coordinate in light space
+float4 computeLSCoordinate(float depth, float4 LS0PosNear, float4 LS0PosFar)
+{
+    return lerp(LS0PosNear, LS0PosFar, depth);
+}
+
+// Computes directional light coordinate in light space using 2 cascades
+float4 computeLSCoordinate2(float depth, float4 LS0PosNear, float4 LS0PosFar, float4 LS1PosNear, float4 LS1PosFar)
+{
+	// get weights
+    float2 viewZ = depth;
+    float2 zNear = float2(viewZ >= _LSPN.xy);
+    float2 zFar = float2(viewZ < _LSPF.xy);
+    float2 weights = zNear * zFar;
+
+	// get light space position for each cascade
+    float4 LS0Pos = lerp(LS0PosNear, LS0PosFar, depth);
+    float4 LS1Pos = lerp(LS1PosNear, LS1PosFar, depth);
+
+	// return cascde light space position
+    return LS0Pos * weights[0] + LS1Pos * weights[1];
+}
+
+// Computes directional light coordinate in light space
+// and if present returns a cascade position
+float4 computeLSCoordinate4(float depth, float4 LS0PosNear, float4 LS0PosFar, float4 LS1PosNear, float4 LS1PosFar,
+	float4 LS2PosNear, float4 LS2PosFar, float4 LS3PosNear, float4 LS3PosFar)
+{
+	// get light space position for each cascade
+    float4 LS0Pos = lerp(LS0PosNear, LS0PosFar, depth);
+    float4 LS1Pos = lerp(LS1PosNear, LS1PosFar, depth);
+    float4 LS2Pos = lerp(LS2PosNear, LS2PosFar, depth);
+    float4 LS3Pos = lerp(LS3PosNear, LS3PosFar, depth);
+
+	// get weights
+    float4 zNear = float4(depth >= _LSPN);
+    float4 zFar = float4(depth < _LSPF);
+    float4 weights = zNear * zFar;
+
+	// return cascde light space position
+    return LS0Pos * weights[0] + LS1Pos * weights[1] + LS2Pos * weights[2] + LS3Pos * weights[3];
+}
+
+// Computes shadowed radiance of the sun over fog.
+// @ depth		- current depth position 
+// @ LS0PosNear - light space near position
+// @ LS0PosFar	- light space far position
+float computeRadiance(float4 lspSS)
+{
+	// ---------------------------------- calculate exponential shadow map -------------------------------------------------------- //
+
+    float radiance = 0.0f;
+    if (lspSS.x >= 0 && lspSS.x <= 1.0 &&
+		lspSS.y >= 0 && lspSS.y <= 1.0 &&
+		lspSS.z >= 0 && lspSS.z <= 1.0)
+    { 
+		// sample occlusion from the shadow map
+        float occ = _DirectionalShadow[float2(lspSS.x * _ShadowResolution.x, lspSS.y * _ShadowResolution.y)].r + _DepthOffset * 0.05f;
+
+		// calc exponential shadow map	
+        float expM = saturate(exp(_Shadow * min(0, (lspSS.z - occ))));
+
+		// contribute to radiance.
+        radiance += expM;
+    }
+    else
+        radiance += 1.0f;
+
+    return radiance;
+}
+
+//
+//
+//
+float computeRampThickness(float depth, float rampStart, float rampEnd)
+{
+    if (depth <= rampStart)
+        return 0;
+
+    if (depth >= rampEnd)
+        return 1;
+
+    float totalLength = rampEnd - rampStart;
+    float pDepth = depth - rampStart;
+    float coeff = pDepth / totalLength;
+
+    return coeff;
+}
+
+
+//
+//
+//
+float3 computeCameraRay(uint3 id, float2 offset, inout float3 nearPos, inout float3 farPos)
+{
+	// calculate texel
+    const float2 texel = id.xy / _VolumeResolution.xy + offset;
+
+	// calculate camera ray
+    float2 uv = (texel - 0.5f) * _CameraFOV;
+    uv.x *= _CameraAspect;
+    float3 ray = _CameraUp * uv.y + _CameraRight * uv.x + _CameraFront;
+
+    // calculate near & far
+    farPos = _CameraPosition + ray * _CameraNear + ray * (_CameraFar - _CameraNear);
+    nearPos = _CameraPosition + ray * _CameraNear;
+
+	// apply render distance 
+    ray = farPos - nearPos;
+     
+    return ray;
+}
+
+//
+//
+//
+float randomHash(float2 uv)
+{
+    float2 noise = (frac(sin(dot(uv, float2(12.9898, 78.233) * 2.0)) * 43758.5453));
+    return abs(noise.x + noise.y) * 0.5;
+}
+
+//
+//
+//
+float randomInt(uint maxValue, float2 uv)
+{
+    return round(randomHash(uv) * maxValue);
+}
+
+// Get non linear depth from linear volume index
+float projectDepth(float3 nearPos, float3 ray, uint idz)
+{
+    float3 sP = ray * ((_CameraFar - _CameraNear) * _RenderDistance);
+    float3 wP = nearPos + sP / _VolumeResolution.z * (idz + 1);
+    float4 eZ = mul(_PV, float4(wP, 1));
+    return eZ.z / (_CameraFar - _CameraNear);
+}
+
+
+float hash12(float2 p)
+{
+    float3 p3 = frac(float3(p.xyx) * .1031);
+    p3 += dot(p3, p3.yzx + 19.19);
+    return frac((p3.x + p3.y) * p3.z);
+}
+
+float Hash2(float2 co)
+{
+    return frac(sin(dot(co.xy, float2(12.9898, 78.233))) * 43758.5453);
+}
+
+//
+//
+//
+//
+[numthreads(8, 8, 1)]
+void VolumeRadiance(uint3 id : SV_DispatchThreadID)
+{
+    // uniformly jitter current temporal frame.
+    float totalFrames = 2 + 2 * _TemporalFilter;
+    int jitteredFrame = _TSSAAFrame + randomInt(totalFrames, id.xy);
+    jitteredFrame -= totalFrames * floor(jitteredFrame / totalFrames);
+     
+    // jitter sample on x/y dimensions.
+    float2  offset            = 0;
+    offset = 1.0 / _VolumeResolution.xy * 0.5 * 0.707;
+    switch (jitteredFrame)
+    { 
+        case 1:
+            offset.x *= -1;
+            break;
+        case 2:
+            offset.x *= -1;
+            offset.y *= -1;
+            break;
+        case 3:
+            offset.y *= -1;
+            break;
+        case 4:
+            offset.x *= -0.5f;
+            break;
+        case 5:
+            offset.x *= -0.5f;
+            offset.y *= -0.5f;
+            break;
+        case 6:
+            offset.y *= -0.5f;
+            break;
+    }
+
+    // get camera ray.
+    float3 farPos, nearPos = 0;
+    float3 ray = computeCameraRay(id, offset, nearPos, farPos);
+
+    // ------------------------------------------------------------ Single Cascade ----------------------------------------------------------- //
+    if (_CascadeCount == 1)
+    {
+        //extract light projection * view matrices for the cascades
+        float4x4 LPV0 = 0;
+        extractShadowProjectionMatrices(LPV0);
+
+	    // compute cascade near & far positions.
+        float4 LS0PosNear = mul(LPV0, float4(nearPos, 1.0f));
+        float4 LS0PosFar = mul(LPV0, float4(farPos, 1.0f));
+
+        float previousDepth = 0;
+
+        // for each volume slice accumulate shadow data
+        for (int i = 0; i < _VolumeResolution.z; i++)
+        {
+            const float depth = _DepthData[i].Step; // step volume depth
+            const float ramp = computeRampThickness(depth, _RampStart, _RampEnd) - computeRampThickness(previousDepth, _RampStart, _RampEnd);
+            const float layerThicknessO = depth - previousDepth;
+            const float layerThickness = lerp(layerThicknessO, ramp, _RampInfluence); // calculate lit layer thickness			
+
+            const float3 currentPos = nearPos + ray * depth; // increment current position
+            const float3 spos = float3(id.xy, i); // volume position
+
+            float radiance = 0;
+
+            // super sample & jitter.
+            _SuperSampling = 1;
+            for (int c = 0; c < _SuperSampling; c++)
+            {
+                // step thickness
+                float SSThickness = layerThicknessO / _SuperSampling;
+
+			    // calculate step
+                float stepThickness = SSThickness * c;
+
+                // temporal offset.
+                stepThickness += SSThickness / totalFrames * jitteredFrame;
+
+                // add offset to current depth.
+                float depthStepPosition = depth + stepThickness;
+
+			    // compute light space position
+                float4 lspSS = computeLSCoordinate(depthStepPosition, LS0PosNear, LS0PosFar);
+
+			    // compute radiance.
+                radiance += computeRadiance(lspSS);
+            }
+
+            radiance /= _SuperSampling;
+
+            _RadianceMap[spos] = radiance;
+            previousDepth = depth;
+        }
+    }
+
+    // ------------------------------------------------------------ Two Cascades ----------------------------------------------------------- //
+    else if (_CascadeCount == 2)
+    {
+        //extract light projection * view matrices for the cascades
+        float4x4 LPV0 = 0;
+        float4x4 LPV1 = 0;
+        extractShadowProjectionMatrices2(LPV0, LPV1);
+
+	    // compute cascade near & far positions.
+        float4 LS0PosNear = mul(LPV0, float4(nearPos, 1.0f));
+        float4 LS0PosFar = mul(LPV0, float4(farPos, 1.0f));
+
+        float4 LS1PosNear = mul(LPV1, float4(nearPos, 1.0f));
+        float4 LS1PosFar = mul(LPV1, float4(farPos, 1.0f));
+
+        float previousDepth = 0;
+
+        // for each volume slice accumulate shadow data
+        for (int i = 0; i < _VolumeResolution.z; i++)
+        {
+            const float depth = _DepthData[i].Step; // step volume depth
+            const float ramp = computeRampThickness(depth, _RampStart, _RampEnd) - computeRampThickness(previousDepth, _RampStart, _RampEnd);
+            const float layerThicknessO = depth - previousDepth;
+            const float layerThickness = lerp(layerThicknessO, ramp, _RampInfluence); // calculate lit layer thickness			
+
+            const float3 currentPos = nearPos + ray * depth; // increment current position
+            const float3 spos = float3(id.xy, i); // volume position
+
+            float radiance = 0;
+
+            // super sample & jitter.
+            _SuperSampling = 1;
+            for (int c = 0; c < _SuperSampling; c++)
+            {
+                // step thickness
+                float SSThickness = layerThicknessO / _SuperSampling;
+
+			    // calculate step
+                float stepThickness = SSThickness * c;
+
+                // temporal offset.
+                stepThickness += SSThickness / totalFrames * jitteredFrame;
+
+                // add offset to current depth.
+                float depthStepPosition = depth + stepThickness;
+
+			    // compute light space position
+                float4 lspSS = computeLSCoordinate2(depthStepPosition, LS0PosNear, LS0PosFar, LS1PosNear, LS1PosFar);
+
+			    // compute radiance.
+                radiance += computeRadiance(lspSS);
+            }
+
+            radiance /= _SuperSampling;
+
+            _RadianceMap[spos] = radiance;
+            previousDepth = depth;
+        }
+    }
+
+    // ------------------------------------------------------------ Four Cascades ----------------------------------------------------------- //
+    else
+    {
+        //extract light projection * view matrices for the cascades
+        float4x4 LPV0 = 0;
+        float4x4 LPV1 = 0;
+        float4x4 LPV2 = 0;
+        float4x4 LPV3 = 0;
+        extractShadowProjectionMatrices4(LPV0, LPV1, LPV2, LPV3);
+
+	    // compute cascade near & far positions.
+        float4 LS0PosNear   = mul(LPV0, float4(nearPos, 1.0f));
+        float4 LS0PosFar    = mul(LPV0, float4(farPos, 1.0f));
+
+        float4 LS1PosNear   = mul(LPV1, float4(nearPos, 1.0f));
+        float4 LS1PosFar    = mul(LPV1, float4(farPos, 1.0f));
+
+        float4 LS2PosNear   = mul(LPV2, float4(nearPos, 1.0f));
+        float4 LS2PosFar    = mul(LPV2, float4(farPos, 1.0f));
+
+        float4 LS3PosNear   = mul(LPV3, float4(nearPos, 1.0f));
+        float4 LS3PosFar    = mul(LPV3, float4(farPos, 1.0f));
+
+        float previousDepth = 0;
+
+        // for each volume slice accumulate shadow data
+        for (int i = 0; i < _VolumeResolution.z; i++)
+        {
+            const float depth = _DepthData[i].Step; // step volume depth
+            const float ramp = computeRampThickness(depth, _RampStart, _RampEnd) - computeRampThickness(previousDepth, _RampStart, _RampEnd);
+            const float layerThicknessO = depth - previousDepth;
+            const float layerThickness = lerp(layerThicknessO, ramp, _RampInfluence); // calculate lit layer thickness			
+
+            const float3 currentPos = nearPos + ray * depth; // increment current position
+            const float3 spos = float3(id.xy, i); // volume position
+
+            float radiance = 0;
+
+            // super sample & jitter.
+            _SuperSampling = 1;
+            for (int c = 0; c < _SuperSampling; c++)
+            {
+                // step thickness
+                float SSThickness = layerThicknessO / _SuperSampling;
+
+			    // calculate step
+                float stepThickness = SSThickness * c;
+
+                // temporal offset.
+                stepThickness += SSThickness / totalFrames * jitteredFrame;
+
+                // add offset to current depth.
+                float depthStepPosition = depth + stepThickness;
+
+			    // compute light space position
+                float4 lspSS = computeLSCoordinate4(depthStepPosition, LS0PosNear, LS0PosFar, LS1PosNear, LS1PosFar, LS2PosNear, LS2PosFar, LS3PosNear, LS3PosFar);
+
+			    // compute radiance.
+                radiance += computeRadiance(lspSS);
+            }
+
+            radiance /= _SuperSampling;
+
+            _RadianceMap[spos] = radiance;
+            previousDepth = depth;
+        }
+    }
+}

@@ -1,0 +1,996 @@
+﻿#pragma kernel InjectParticipatingMedium
+#pragma kernel InjectShadowedLight
+
+#define RADIAN					0.0174533
+#define PI						3.14159265359
+
+// ------------------------------------------- Structs ----------------------------------------------------------- //
+
+struct POINT_LIGHT
+{
+	float3		Position;
+	float		Intensity;
+	float3		Color;
+	float		Range;
+};
+
+struct SPOT_LIGHT
+{
+	float3		Position;
+	float		Intensity;
+	float3		Color;
+	float		Range;
+	float3		Direction;
+	float		Angle;
+    float2      Attenuation;
+};
+
+struct BOX_VOLUME
+{
+	float3 Position;
+	float3 Dimensions;
+	float4 Color;
+    int Mode;
+    float Absorption;
+    float SoftEdges;
+};
+
+struct ELLIPSOID_VOLUME
+{
+	float3 Position;
+	float3 Dimensions;
+	float4 Color;
+    int Mode;	
+    float Absorption;
+    float SoftEdges;
+};
+
+
+// ------------------------------------------- Buffers ----------------------------------------------------------- //
+
+StructuredBuffer<POINT_LIGHT>		_PointLightData;
+StructuredBuffer<SPOT_LIGHT>		_SpotLightData;
+
+StructuredBuffer<BOX_VOLUME>			_BoxVolumeData;
+StructuredBuffer<ELLIPSOID_VOLUME>		_EllipsoidVolumeData;
+
+
+RWTexture3D<float4>            _PMVolume;
+Texture3D<float4>              _PreviousPMVolume;
+SamplerState                    sampler_PreviousPMVolume;
+
+
+RWTexture3D<float4>            _PMRadiance;
+Texture3D<float>               _PreviousPMRadiance;
+SamplerState                    sampler_PreviousPMRadiance;
+
+
+
+Texture3D<float>               _NoiseLUT;
+SamplerState            sampler_NoiseLUT;
+
+Texture3D<float>               _RadianceMap;
+
+
+
+uniform float4x4    _PVHistory;
+
+// ------------------------------------------- Uniforms ----------------------------------------------------------- //
+
+uniform int			_PointLightCount;
+uniform int			_SpotLightCount;
+
+uniform float		_CameraNear;
+uniform	float		_CameraFar;
+
+uniform float3		_CameraPosition;
+uniform float3		_CameraUp;
+uniform float3		_CameraRight;
+uniform float3		_CameraFront;
+uniform float		_CameraAspect;
+uniform float		_CameraFOV;
+
+uniform int			_BoxVolumeCount;
+uniform int			_EllipsoidVolumeCount;
+
+uniform float3		_SunDirection;
+
+uniform float3      _VolumeResolution;
+
+
+uniform float4x4    _PV;
+uniform float       _RenderDistance;
+
+uniform bool        _Noise;
+uniform float       _NoiseSize;
+
+
+uniform float3      _WindVelocity;
+
+
+uniform float       _NoiseFadeBottomHeight;
+uniform float       _NoiseFadeTopHeight;
+
+uniform float       _NoiseHeightBottom;
+uniform float       _NoiseHeightTop;
+uniform float       _NoiseInfluenceBottom;
+uniform float       _NoiseInfluenceTop;
+
+uniform float3      _NoiseFrequency;
+uniform float3      _NoiseFrequencyRandom;
+
+uniform bool        _NoiseOcclusion;
+
+uniform float       _OcclusionRayDistance;
+uniform float       _OcclusionStrength;
+uniform float		_DirectStrength;
+uniform float       _OcclusionBlend;
+uniform float       _OutlineRadius;
+
+uniform int         _TemporalFilter;
+uniform int         _TSSAAFrame;
+uniform int         _SuperSampling;
+uniform float4      _CameraDimensions;
+
+uniform float       _Vignetting;
+uniform float       _DepthAttenuation;
+uniform bool        _TemporalReprojection;
+
+uniform float4      _CloudDirectColor;
+
+uniform bool        _EnableCloudSpacing;
+uniform float       _CloudSpacingSize;
+uniform float3      _CloudSpacingFrequency;
+
+
+
+// ---------------------------------------------- Phase Functions ----------------------------------------------------------- //
+
+// Henyey-Greenstein phase function
+// @ dotLE	- light to eye dot product
+// @ g		- anistropy parameter
+float HenyeyGreensteinPhase(float dotLE, float g)
+{
+    const float g2 = 1.0 - g * g;
+    float h = (1.0f + (g * g) - (2 * g * dotLE));
+    return (g2 / (4.0f * PI * pow(max(0.0, h), 1.5f)));
+}
+
+float SchlickPhaseFunction(float dotLE, float k)
+{
+    const float k2 = 1.0 - k * k;
+    float h = -((k * dotLE) - 1.0f);
+    return (k2 / (4.0f * PI * h * h));
+}
+
+float ReyLeighPhaseFunction(float3 ray)
+{
+    float fCos = dot(_SunDirection, ray) / length(ray);
+    float fCos2 = fCos * fCos;
+    return 0.75f + 0.75f * fCos2;
+}
+
+float RadialPhaseFunction(float dotLE)
+{
+    float factor = (1.0f - abs(dotLE));
+    return (factor * (1.0f / (PI * PI)));
+}
+	
+// Computes a point light.
+// @ wPos	- world position
+// @ light	- POINT_LIGHT struct.
+float3 computePointLight(float3 wPos, POINT_LIGHT light)
+{
+	float3	direction = light.Position - wPos;
+	float diff = max(0, light.Range - length(direction));
+	float len = diff / light.Range;
+    len *= len;
+	return light.Color * len * light.Intensity;
+}
+
+// Computes a spotlight
+// @ wPos	- world position
+// @ light	- SPOT_LIGHT struct.
+float3 computeSpotLight(float3 wPos, SPOT_LIGHT light, float depth)
+{
+	float3  color           = 0.0f;
+
+    // area
+	float3	difference      = normalize(_CameraPosition - wPos);  
+    float3  difference2     = wPos - light.Position;
+
+    float   distSquared     = dot(difference2, difference2);
+    float   rangeInvQuad    = 1.0f / (light.Range * light.Range);
+
+    float   ratio2          = distSquared * rangeInvQuad;
+    float   num             = saturate(1.0f - (ratio2 * ratio2));
+    float   falloff         = (num * num) / (distSquared + 1.0f);
+
+
+
+    // spot.
+    float   diff            = max(0, light.Range - length(difference2));
+    float   len             = diff - light.Range;
+
+    float   dirDot          = saturate(-dot(normalize(-difference2), normalize(light.Direction)));
+
+
+    float   spotAtt         = saturate(dirDot - light.Angle);
+       spotAtt         = spotAtt > 0 ? 1 : 0;
+
+
+    if (falloff > 0)
+        color += saturate(light.Color * exp(-(1.0f - falloff))) * spotAtt * light.Intensity;
+
+
+     
+    return color;
+    /*
+	float diff	= max(0, light.Range - length(difference));
+	float len	= diff / light.Range;
+
+	float dirDot	= saturate(-dot(normalize(difference), normalize(light.Direction)));
+	float spotAtt	= dirDot - light.Angle;
+    */
+
+
+    
+
+
+
+
+
+
+
+    // cap antialiasing
+   /* float softnessCapMod        = 1;
+    float softness              = light.Attenuation.x;
+    float softnessCap           = light.Attenuation.y;
+
+    if (length(direction) < softnessCap)
+    {
+        float coeff = (softnessCap - length(direction)) / softnessCap;
+        softnessCapMod = lerp(1, 0, coeff);
+    }
+
+    // sideways antialiasing.
+    float sAngle = light.Angle * softness;
+
+    if (spotAtt < sAngle && spotAtt >= 0)
+    {
+        float coeff = (sAngle - spotAtt) / sAngle;
+        spotAtt = lerp(spotAtt * 0.5f, spotAtt, 1.0f - coeff);
+    }
+    else if (spotAtt > -sAngle && spotAtt < 0)
+    {
+        float coeff = (-sAngle + spotAtt) / sAngle;
+        spotAtt = lerp(spotAtt * 0.5f, 0, coeff);
+    }
+
+    spotAtt = saturate(spotAtt) * max(0.2f, (1.0f - exp(-light.Angle)));
+
+    color += light.Color * dirDot * light.Intensity * spotAtt * len * softnessCapMod; */
+
+
+}
+
+//
+//
+//
+float4 computeBoxVolume(float3 wPos, BOX_VOLUME volume_data)
+{
+	float3 diff = abs(volume_data.Position - wPos);
+
+	if (volume_data.Dimensions.x >= diff.x &&
+		volume_data.Dimensions.y >= diff.y &&
+		volume_data.Dimensions.z >= diff.z)
+	{
+		float3	attenuation		= (volume_data.Dimensions - diff) / volume_data.Dimensions;
+
+        float   attenLen        = 1;
+        if (volume_data.Mode == 1 ||
+            volume_data.Mode == 2 ||
+            volume_data.Mode == 3)
+            attenLen = 1;
+        else
+            attenLen = lerp(1.0f, min(min(attenuation.x, attenuation.y), attenuation.z), volume_data.SoftEdges);
+
+        return float4(volume_data.Color.rgb * volume_data.Color.a, volume_data.Absorption) * attenLen;
+    }
+
+	return 0;
+}
+
+//
+//
+//
+float4 computeEllipsoidVolume(float3 wPos, ELLIPSOID_VOLUME volume_data)
+{
+	float3	path	= volume_data.Position - wPos;
+	float3	rad		= path / volume_data.Dimensions;
+	float	radius	= rad.x*rad.x + rad.y*rad.y + rad.z*rad.z;
+
+
+    float   atten    = 1.0f - sqrt(radius);
+    float   atten2   = atten;
+
+    if (atten2 < 0)     atten = 0;
+    else                atten = 1;
+
+    atten = lerp(atten, saturate(atten2), volume_data.SoftEdges);
+
+    return float4(volume_data.Color.rgb * volume_data.Color.a * atten, volume_data.Absorption * atten);
+}
+
+
+//
+//
+//
+void computeCloudsAttenuation(float3 worldPos, inout float density, inout float density2, inout float cloudOcclusion, inout float3 cloudScatter, inout float noiseFadeLerp)
+{
+    if (worldPos.y < _NoiseHeightTop && worldPos.y > _NoiseHeightBottom)
+    {
+         // interpolate densities.
+        float densityBottom     = lerp(0.5f, density, _NoiseInfluenceBottom);
+        float densityTop        = lerp(0.5f, density, _NoiseInfluenceTop);
+
+        float densityBottom2    = lerp(0.5f, density2, _NoiseInfluenceBottom);
+        float densityTop2       = lerp(0.5f, density2, _NoiseInfluenceTop);
+
+        float occlusionBottom   = lerp(0.0f, cloudOcclusion, _NoiseInfluenceBottom);
+        float3 scatterBottom    = lerp(0.0f, cloudScatter, _NoiseInfluenceBottom);
+
+        float occlusionTop      = lerp(0.0f, cloudOcclusion, _NoiseInfluenceTop);
+        float3 scatterTop       = lerp(0.0f, cloudScatter, _NoiseInfluenceTop);
+
+
+        float length        = _NoiseHeightTop - _NoiseHeightBottom;
+        float coeff         = (worldPos.y - _NoiseHeightBottom) / length;
+
+        density             = lerp(densityBottom, densityTop, coeff);
+        density2            = lerp(densityBottom2, densityTop2, coeff);
+
+        cloudOcclusion      = lerp(occlusionBottom, occlusionTop, coeff);
+        cloudScatter        = lerp(scatterBottom, scatterTop, coeff);
+
+        // fade bottom
+        if (worldPos.y > _NoiseHeightBottom && worldPos.y < _NoiseHeightBottom + _NoiseFadeBottomHeight)
+        {
+            float position = worldPos.y - _NoiseHeightBottom;
+            position /= _NoiseFadeBottomHeight;
+
+            density         = lerp(0.5f, density, position);
+            density2        = lerp(0.5f, density2, position);
+
+            cloudOcclusion  = lerp(0.0f, cloudOcclusion, position);
+            cloudScatter    = lerp(0.0f, cloudScatter, position);
+
+            noiseFadeLerp = position;
+        }
+
+        // fade top
+        else if (worldPos.y < _NoiseHeightTop && worldPos.y > _NoiseHeightTop - _NoiseFadeTopHeight)
+        {
+            float position = _NoiseHeightTop - worldPos.y;
+            position /= _NoiseFadeTopHeight;
+
+            density         = lerp(density, 0.5f, 1.0f - position);
+            density2        = lerp(density2, 0.5f, 1.0f - position);
+
+            cloudOcclusion  = lerp(0.0f, cloudOcclusion, position);
+            cloudScatter    = lerp(0.0f, cloudScatter, position);
+
+            noiseFadeLerp = position;
+        }
+    }
+    else
+    {
+        density             = 0.5f;
+        density2            = 0.5f;
+        cloudOcclusion      = 0;
+        cloudScatter        = 0;
+    }
+}
+
+
+
+// Computes camera world space ray for this volume froxel.
+// @ id - volume position.
+float3 computeCameraRay(float2 id, float2 offset)
+{
+	// calculate texel
+	const float2 			texel = (id + offset) / _VolumeResolution.xy;
+
+	// calculate camera ray
+	float2 uv = (texel - 0.5f) * _CameraFOV;
+	uv.x *= _CameraAspect;
+	return _CameraUp * uv.y + _CameraRight * uv.x + _CameraFront;
+}
+
+// Get non linear depth from linear volume index
+float projectDepth(float3 nearPos, float3 ray, uint idz)
+{
+    float3 sP    = ray * ((_CameraFar - _CameraNear) * _RenderDistance);
+    float3 wP    = nearPos + sP / _VolumeResolution.z * (idz + 1);
+    float4 eZ    = mul(_PV, float4(wP, 1));
+    return eZ.z / (_CameraFar - _CameraNear);
+}
+
+
+
+
+float3 CosineSampleHemisphere(float u1, float u2)
+{
+    const float r = sqrt(u1);
+    const float theta = 2 * PI * u2;
+ 
+    const float x = r * cos(theta);
+    const float y = r * sin(theta);
+ 
+    return float3(x, y, sqrt(max(0.0f, 1 - u1)));
+}
+
+
+float LinearDepth(float z)
+{
+    float zc0 = 1.0 - _CameraFar / _CameraNear;
+    float zc1 = _CameraFar / _CameraNear;
+    return 1.0 / (zc0 * z + zc1);
+}
+
+float LinearDepth(float z, SPOT_LIGHT light)
+{
+    float near  = 0.2f;
+    float far   = light.Range;
+
+
+    float zc0 = 1.0 - far / near;
+    float zc1 = far / near;
+    return 1.0 / (zc0 * z + zc1);
+}
+
+
+float3 Reprojection(float3 worldPos, float4x4 VP)
+{
+    float4 coord = mul(VP, float4(worldPos, 1.0f));
+
+    float3 volumeProjection = (coord.xyz / coord.w);
+    volumeProjection = volumeProjection * 0.5f + 0.5f;
+    volumeProjection.z = LinearDepth(volumeProjection.z) / _RenderDistance;
+    volumeProjection *= _VolumeResolution;
+
+    volumeProjection.xy += 0.5f;
+    volumeProjection.z -= 1.5f;
+
+    return volumeProjection;
+}
+ 
+bool IsInVolume(float3 position)
+{
+    if (position.x >= 0.0f && position.x <= _VolumeResolution.x &&
+        position.y >= 0.0f && position.y <= _VolumeResolution.y &&
+        position.z >= 0 && position.z <= _VolumeResolution.z)
+        return true;
+    return false;
+}
+
+float hash12(float2 p)
+{
+    float3 p3 = frac(float3(p.xyx) * .1031);
+    p3 += dot(p3, p3.yzx + 19.19);
+    return frac((p3.x + p3.y) * p3.z);
+}
+
+float Hash2(float2 co)
+{
+    return frac(sin(dot(co.xy, float2(12.9898, 78.233))) * 43758.5453);
+}
+
+//
+//
+//
+float randomHash(float2 uv)
+{
+    float2 noise = (frac(sin(dot(uv, float2(12.9898, 78.233) * 2.0)) * 43758.5453));
+    return abs(noise.x + noise.y) * 0.5;
+}
+
+//
+//
+//
+float randomInt(uint maxValue, float2 uv)
+{
+    return round(randomHash(uv) * maxValue);
+}
+
+
+
+[numthreads(4, 4, 4)]
+void InjectParticipatingMedium(uint3 id : SV_DispatchThreadID)
+{
+    // uniformly jitter current temporal frame.
+    float totalFrames = 2 + 2 * _TemporalFilter;
+    int jitteredFrame = _TSSAAFrame + randomInt(totalFrames, id.xy);
+    jitteredFrame -= totalFrames * floor(jitteredFrame / totalFrames);
+     
+    // jitter sample on x/y dimensions.
+    // TODO: put this to array.
+    float2 offset = 0;
+    switch (jitteredFrame)
+    {
+        case 1:
+            offset = float2(0, 0);
+            break;
+        case 2:
+            offset = normalize( float2(0.5f, 0.5f) ) * 0.5f;
+            break;
+        case 3:
+            offset = normalize(float2(-0.5f, -0.5f)) * 0.5f;
+            break;
+        case 4:
+            offset = normalize(float2(-0.5f, 0.5f)) * 0.5f;
+            break;
+        case 5:
+            offset = normalize(float2(0.5f, -0.5f)) * 0.5f;
+            break;
+        case 6:
+            offset = float2(0, 0);
+            break;
+    }
+
+    offset *= 0.707f;
+
+
+
+    // get camera ray.
+    float3      ray                 = computeCameraRay(id.xy, offset * 0.5f);
+
+	// calculate near & far
+    float3      farPos              = _CameraPosition + ray * _CameraNear + ray * (_CameraFar - _CameraNear);
+    float3      nearPos             = _CameraPosition + ray * _CameraNear;
+
+    // get prev and curr depths
+    float       previousDepth       = projectDepth(nearPos, ray, id.z);
+    float       depth               = projectDepth(nearPos, ray, id.z + 1);
+
+
+    float       layerThickness      = depth - previousDepth;
+
+
+    float       depthJitter         = (jitteredFrame / totalFrames) * layerThickness;
+
+    float3      previousPos         = lerp(nearPos, farPos, previousDepth); 
+    float3      currentPos          = lerp(nearPos, farPos, depth); 
+
+
+
+
+    float       density                 = 0.5f;
+    float       density2                = 0.5f;
+
+    float       cloudOcclusion          = 0;
+    float3      cloudScatter            = 0;
+
+    
+    float       nonAttenuatedDensity            = 0.5f;
+    float       nonAttenuatedCloudOcclusion     = 0;
+    float3      nonAttenuatedCloudScatter       = 0;
+
+    // clouds
+    // TODO: jitter on x/y
+    if (_Noise)
+    {
+        float       noiseFadeLerp           = 1;
+        float3      currentPosClouds        = lerp(nearPos, farPos, depth + depthJitter); 
+        float3      animatedPos             = currentPosClouds + _WindVelocity;
+        float3      CloudLUTUV              = animatedPos * _NoiseSize * 0.01f;
+
+        density     = _NoiseLUT.SampleLevel(sampler_NoiseLUT, CloudLUTUV, 0);
+
+
+        if (_NoiseOcclusion)
+        {
+            float opacityShine  = 0;
+            float opacity       = density;
+            float opacity2      = _NoiseLUT.SampleLevel(sampler_NoiseLUT, CloudLUTUV + normalize(-_SunDirection) * _OcclusionRayDistance, 0);
+
+            if (opacity < opacity2)
+            {
+                if (opacity > 0.5f)
+                {
+                    float coeff = opacity2 - opacity;
+                    float smooth = 1.0f - (1.0f - opacity) * 2.0f;
+                    float surface = max(0, dot(-_SunDirection, normalize(ray)));
+                    opacity = coeff * smooth * surface;
+
+                }
+                else
+                    opacity = 0.0f;
+            }
+            else
+            {
+                if (opacity < 0.5f && opacity > 0.5f - _OutlineRadius)
+                {
+                    opacityShine += lerp(1.0f, 0.0f, abs(opacity - 0.5f - _OutlineRadius) / (0.5f - _OutlineRadius));
+                }
+            }
+    
+            // ignore rendering nearby cloud oclusion
+            opacity             *= lerp(1.0f, depth, _Vignetting);
+            opacityShine        *= lerp(1.0f, depth, _Vignetting);
+  
+            // vigneting on clouds too to reduce flicker.
+           // float sideCoeff         = 1.0f - abs((0.5 - id.x / _VolumeResolution.x));
+            //float verticalCoeff     = 1.0f - abs((0.5 - id.y / _VolumeResolution.y));
+           // float coeff             = lerp(1.0f, sideCoeff * verticalCoeff, _DepthAttenuation);
+
+          //  opacity         *= coeff;
+         //   opacityShine    *= coeff;
+
+            // make coefficients.
+            cloudOcclusion  = saturate(opacity * _OcclusionStrength * 8.0f);
+            cloudScatter    = saturate(opacityShine * _DirectStrength * 8.0f);
+
+            cloudScatter    += opacityShine * _DirectStrength * _CloudDirectColor.rgb * 8.0f;
+            cloudScatter    += (1.0f - cloudOcclusion) * _DirectStrength * _CloudDirectColor.rgb * 0.5f;
+            cloudScatter    = saturate(cloudScatter);
+        }
+
+
+        if (_EnableCloudSpacing)
+        {
+            float3 currentPosClouds = lerp(nearPos, farPos, depth + depthJitter) * _CloudSpacingFrequency;
+            float3 animatedPos = currentPosClouds + _WindVelocity;
+            float3 CloudLUTUV = animatedPos * _CloudSpacingSize * 0.01f;
+
+            float spacing = _NoiseLUT.SampleLevel(sampler_NoiseLUT, CloudLUTUV, 0);
+            spacing = (spacing - 0.5f) * 2.0f;
+
+            density             *= spacing;
+            cloudOcclusion      *= spacing;
+            cloudScatter        *= spacing * 4.0f;
+            cloudScatter        = saturate(cloudScatter);
+        }
+
+
+        nonAttenuatedDensity            = density;
+        nonAttenuatedCloudOcclusion     = cloudOcclusion;
+        nonAttenuatedCloudScatter       = cloudScatter;
+
+        computeCloudsAttenuation(currentPos, density, density2, cloudOcclusion, cloudScatter, noiseFadeLerp);
+    }
+
+
+
+    float3 lights       = 0;
+    float4 volumes      = 0;
+    float  absorption   = 0;
+
+    // ########################################## Lights ################################################################## //
+
+    // compute spot lights.
+	for (int n = 0; n < _SpotLightCount; n++)
+	{
+		SPOT_LIGHT light = _SpotLightData[n];
+
+        float3 spot = 0;
+        for (int i = 1; i <= _SuperSampling; i++)
+        {
+            float3 worlStepPos = lerp(previousPos, currentPos, (float)i / _SuperSampling);
+            spot += computeSpotLight(worlStepPos, light, depth);
+        }
+
+        spot /= _SuperSampling;
+        lights += spot;
+    }
+
+	// compute point lights.
+	for (int p = 0; p < _PointLightCount; p++)
+	{
+		POINT_LIGHT light = _PointLightData[p];
+
+        float3 pointC = 0;
+        for (int i = 1; i <= _SuperSampling; i++)
+        {
+            float3 worlStepPos = lerp(previousPos, currentPos, (float) i / _SuperSampling);
+            pointC += computePointLight(worlStepPos, light);
+        }
+
+        pointC /= _SuperSampling;
+        lights += pointC;
+    }
+
+
+    // ########################################## Fog Volumes ################################################################## //
+
+    // accumulate fog volume modifiers.
+    float cutAll            = 1;
+    float cutClouds         = 1;
+    float cutDensity        = 1;
+    float fillClouds        = 1;
+
+	// compute box volumes
+    for (int i = 0; i < _BoxVolumeCount; i++)
+    {
+        BOX_VOLUME volume_data = _BoxVolumeData[i];
+
+        float4 box = 0;
+        for (int i = 1; i <= _SuperSampling; i++)
+        {
+            float3 worlStepPos = lerp(previousPos, currentPos, (float) i / _SuperSampling);
+            box += computeBoxVolume(worlStepPos, volume_data);
+        }
+
+        box /= _SuperSampling;
+
+        if (volume_data.Mode == 1)              cutAll      -= box.a;           // cut all.
+        else if (volume_data.Mode == 2)         cutClouds   -= box.a;           // cut clouds.
+        else if (volume_data.Mode == 3)         cutDensity  -= box.a;           // cut density
+        else if (volume_data.Mode == 4)
+        {
+            fillClouds      -= box.a;         // fill clouds
+            nonAttenuatedCloudScatter    *= box.rgb;
+            nonAttenuatedCloudScatter    += box.rgb;
+        }
+
+        if (volume_data.Mode != 0)  // not opaque - is a modifier
+            box = 0;
+
+        volumes += box;
+    }
+
+	// compute ellipsoid volumes
+    for (int k = 0; k < _EllipsoidVolumeCount; k++)
+    {
+        ELLIPSOID_VOLUME volume_data = _EllipsoidVolumeData[k];
+
+        float4 ellipsoid = 0;
+        for (int i = 1; i <= _SuperSampling; i++)
+        {
+            float3 worlStepPos = lerp(previousPos, currentPos, (float) i / _SuperSampling);
+            ellipsoid += computeEllipsoidVolume(worlStepPos, volume_data);
+        }
+
+        ellipsoid /= _SuperSampling;
+
+        if (volume_data.Mode == 1)                  cutAll          -= ellipsoid.a;         // cut all. 
+        else if (volume_data.Mode == 2)             cutClouds       -= ellipsoid.a;         // cut clouds.
+        else if (volume_data.Mode == 3)             cutDensity      -= ellipsoid.a;         // cut density
+        else if (volume_data.Mode == 4)        
+        { 
+            fillClouds      -= ellipsoid.a;      // fill clouds
+            nonAttenuatedCloudScatter           *= ellipsoid.rgb;
+            nonAttenuatedCloudScatter           += ellipsoid.rgb;
+        }
+
+        if (volume_data.Mode != 0)  // not opaque - is a modifier
+            ellipsoid = 0;
+
+        volumes += ellipsoid;
+    }
+
+
+
+    // compute volume modifiers.
+    cutAll      = saturate(cutAll);
+    cutClouds   = saturate(cutClouds);
+    cutDensity  = saturate(cutDensity);
+    fillClouds  = saturate(fillClouds);
+
+    // cut all
+    density             *= cutAll;
+    density2            *= cutAll;
+    cloudOcclusion      *= cutAll;
+    cloudScatter        *= cutAll;
+    lights              *= cutAll;
+
+    // cut clouds
+    cloudOcclusion      *= cutClouds;
+    cloudScatter        *= cutClouds;
+    density             = lerp(0.5f, density, cutClouds);
+
+    // cut density
+    density             *= cutDensity;
+
+    // fill clouds
+    density             = lerp(nonAttenuatedDensity, density, fillClouds);
+    cloudOcclusion      = lerp(nonAttenuatedCloudOcclusion, cloudOcclusion, fillClouds);
+    cloudScatter        = lerp(nonAttenuatedCloudScatter, cloudScatter, fillClouds);
+
+
+
+    // ------------------------------------------------------------- TODO: height attenuation.
+
+    // add sun & cloud contribution.
+    float PMRadiance    = saturate(_RadianceMap[id] * density);
+    lights       += cloudScatter * PMRadiance;
+    absorption   += cloudOcclusion;// + lights.r;
+
+    // multiply by density if clouds without occlusion used.
+    if (!_NoiseOcclusion)
+        lights *= density;
+
+    // add absorption from volumes
+    absorption += volumes.w;
+
+
+    // combine volumes, lights, clouds.
+    float4  PMVolume            = float4(volumes.rgb + lights, absorption);
+
+
+
+
+
+
+    // ################################################################# Temporal Reprojection ################################################################# //
+
+    // reproject previous frame information
+    float currentWeight = 1.0f / totalFrames;
+    float historyWeight = 1.0f - currentWeight;
+
+    float3 reprojectedSample = Reprojection(currentPos, _PVHistory);
+
+    // if out of bounds - cull
+    if (!IsInVolume(reprojectedSample))
+    {
+        currentWeight = 1.0f;
+        historyWeight = 0.0f;
+    }
+
+    if (_TemporalReprojection)
+    {
+        // sample history
+        float4  previousPMVolume        = _PreviousPMVolume.SampleLevel(sampler_PreviousPMVolume, reprojectedSample / _VolumeResolution, 0);
+        float   previousPMRadiance      = _PreviousPMRadiance.SampleLevel(sampler_PreviousPMRadiance, reprojectedSample / _VolumeResolution, 0);
+
+        // write blended volumes
+        _PMVolume[id]       = previousPMVolume * historyWeight + saturate(PMVolume) * currentWeight;
+        _PMRadiance[id]     = previousPMRadiance * historyWeight + saturate(PMRadiance) * currentWeight;
+    }
+    else
+    {
+        _PMVolume[id]                   = saturate(PMVolume);
+        float previousPMRadiance        = _PreviousPMRadiance.SampleLevel(sampler_PreviousPMRadiance, reprojectedSample / _VolumeResolution, 0);
+        _PMRadiance[id]                 = previousPMRadiance * historyWeight + saturate(PMRadiance) * currentWeight;
+    }
+}
+
+
+
+
+Texture2D<float> _ShadowMap;
+uniform float4x4 _ShadowProjection;
+
+uniform float _Angle;
+uniform float2 _Attenuation;
+uniform float4 _Color;
+uniform float3 _Direction;
+uniform float _Intensity;
+uniform float3 _Position;
+uniform float _Range;
+uniform float2 _ShadowResolution;
+uniform float _ShadowStrength;
+
+
+
+[numthreads(4, 4, 4)]
+void InjectShadowedLight(uint3 id : SV_DispatchThreadID)
+{
+    // uniformly jitter current temporal frame.
+    float totalFrames = 2 + 2 * _TemporalFilter;
+    int jitteredFrame = _TSSAAFrame + randomInt(totalFrames, id.xy);
+    jitteredFrame -= totalFrames * floor(jitteredFrame / totalFrames);
+     
+    // jitter sample on x/y dimensions.
+    // TODO: put this to array.
+    float2 offset = 0;
+    switch (jitteredFrame)
+    {
+        case 1:
+            offset = float2(0, 0);
+            break;
+        case 2:
+            offset = normalize(float2(0.5f, 0.5f)) * 0.5f;
+            break;
+        case 3:
+            offset = normalize(float2(-0.5f, -0.5f)) * 0.5f;
+            break;
+        case 4:
+            offset = normalize(float2(-0.5f, 0.5f)) * 0.5f;
+            break;
+        case 5:
+            offset = normalize(float2(0.5f, -0.5f)) * 0.5f;
+            break;
+        case 6:
+            offset = float2(0, 0);
+            break;
+    }
+
+    // get camera ray.
+    float3      ray                 = computeCameraRay(id.xy, offset * 0.25f);
+
+	// calculate near & far
+    float3      farPos              = _CameraPosition + ray * _CameraNear + ray * (_CameraFar - _CameraNear);
+    float3      nearPos             = _CameraPosition + ray * _CameraNear;
+
+    // get prev and curr depths
+    float       previousDepth       = projectDepth(nearPos, ray, id.z);
+    float       depth               = projectDepth(nearPos, ray, id.z + 1);
+
+
+    float       layerThickness      = depth - previousDepth;
+
+
+    float       depthJitter         = (jitteredFrame / totalFrames) * layerThickness;
+
+    float3      previousPos         = lerp(nearPos, farPos, previousDepth); 
+    float3      currentPos          = lerp(nearPos, farPos, depth + depthJitter); 
+    float3      currentPosNotJittered          = lerp(nearPos, farPos, depth);
+
+
+
+    SPOT_LIGHT light;
+    light.Angle             = _Angle;
+    light.Attenuation       = _Attenuation;
+    light.Color             = _Color.rgb;
+    light.Direction         = _Direction;
+    light.Intensity         = _Intensity;
+    light.Position          = _Position;
+    light.Range             = _Range;
+
+
+      
+    float shadow    = 0;
+    for (int i = 1; i <= _SuperSampling; i++)
+    {
+        float3 worldStepPos = previousPos + (currentPos - previousPos) * ((float) i / _SuperSampling);
+
+        float4 lightSpace = mul(_ShadowProjection, float4(worldStepPos, 1.0f));
+        lightSpace.xyz /= lightSpace.w;
+        lightSpace.xyz = (lightSpace.xyz + 1.0) * 0.5;
+
+        if (lightSpace.x >= 0 && lightSpace.x <= 1.0f)
+            if (lightSpace.y >= 0 && lightSpace.y <= 1.0f)
+                if (lightSpace.z > 0 && lightSpace.z <= 1.0f)
+                {
+                    float spotDepth = _ShadowMap[lightSpace.xy * _ShadowResolution];
+                    shadow += saturate(exp(_ShadowStrength * 1000000.0f * min(0, ((1.0f - spotDepth) - lightSpace.z))));
+                }
+    }
+
+    shadow /= _SuperSampling;
+
+
+
+     // ################################################################# Temporal Reprojection ################################################################# //
+
+    // reproject previous frame information
+    float currentWeight = 1.0f / totalFrames;
+    float historyWeight = 1.0f - currentWeight;
+
+    float3 reprojectedSample = Reprojection(currentPosNotJittered, _PVHistory);
+
+    // if out of bounds - cull
+    if (!IsInVolume(reprojectedSample))
+    {
+        currentWeight = 1.0f;
+        historyWeight = 0.0f;
+    }
+
+    float4 PMVolume = _PMVolume[id];
+
+    if (_TemporalReprojection)
+    {
+        // sample history
+        float4 previousPMVolume = _PreviousPMVolume.SampleLevel(sampler_PreviousPMVolume, reprojectedSample / _VolumeResolution, 0);
+        
+        float4 spotLight        = PMVolume + float4(computeSpotLight(currentPos, light, depth) * shadow, 0);
+
+        // write blended volumes
+        _PMVolume[id] = previousPMVolume * historyWeight + saturate(spotLight) * currentWeight;
+    }
+    else
+    { 
+        _PMVolume[id] = PMVolume + float4(computeSpotLight(currentPos, light, depth) * shadow, 0);
+    }
+}

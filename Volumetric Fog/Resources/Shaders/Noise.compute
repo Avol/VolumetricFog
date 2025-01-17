@@ -1,0 +1,351 @@
+﻿#pragma kernel Noise
+
+#define NOISE_SIMPLEX_1_DIV_289 0.00346020761245674740484429065744f
+
+RWTexture3D<float>  _VolumeMediumMap;
+RWTexture3D<float4> _NoiseOcclusionMap;
+
+
+Texture2D<float4> _NoiseTexture;
+SamplerState sampler_NoiseTexture;
+
+// ------------------------------------------- Uniforms ----------------------------------------------------------- //
+
+uniform float2		_Resolution;
+
+uniform float		_NoiseSize;
+
+uniform float		_CameraNear;
+uniform	float		_CameraFar;
+
+uniform bool		_EnableNoise;
+ 
+uniform float3		_NoiseColor;
+uniform float2		_NoiseTextureResolution;
+uniform int			_NoiseOctaves;
+
+uniform float		_NoiseInfluence;
+
+uniform float		_NoiseHeightBottom;
+uniform float		_NoiseHeightTop;
+uniform float		_NoiseInfluenceBottom;
+uniform float		_NoiseInfluenceTop;
+
+uniform float		_NoiseFadeBottomHeight;
+uniform float		_NoiseFadeTopHeight;
+
+uniform int         _NoiseType;
+
+uniform float3      _NoiseFrequency;
+uniform float3      _SpacingFrequency;
+
+uniform float       _NoiseDensityScale;
+
+// ---------------------------------------------- Hash Functions ----------------------------------------------------------- //
+
+// semi-random linear function x
+// @ n	- seed
+float Hash(float n)
+{
+    return frac(sin(n) * 43758.5453123);
+}
+
+// semi-random linear function xy
+// @ co - seed
+float Hash2(float2 co)
+{
+    return frac(sin(dot(co.xy, float2(12.9898, 78.233))) * 43758.5453);
+}
+
+// Procedural 3D noise
+// A purely procedural 3D noise, counterpart for the texture based one.
+// @ x - noise seed
+float ProceduralNoise(float3 x)
+{
+    float3 p = floor(x);
+    float3 f = frac(x);
+    f = f * f * (3.0 - 2.0 * f);
+
+    float n = p.x + p.y * 157.0 + 113.0 * p.z;
+    return lerp(lerp(lerp(Hash(n + 0.0), Hash(n + 1.0), f.x),
+		lerp(Hash(n + 157.0), Hash(n + 158.0), f.x), f.y),
+		lerp(lerp(Hash(n + 113.0), Hash(n + 114.0), f.x),
+			lerp(Hash(n + 270.0), Hash(n + 271.0), f.x), f.y), f.z);
+}
+
+
+// Texture based 3D noise
+// Fast 3D (value) noise by using two cubic-smooth bilinear interpolations in a LUT, 
+// Is much faster than its purely procedural counterpart. 
+// Performance Depends on the cpu to gpu memory read speed and the texture resolution.
+float TextureNoise(float3 x)
+{
+    float3 p = floor(x);
+    float3 f = frac(x);
+    f = f * f * (3.0 - 2.0 * f);
+    float2 uv = (p.xz + float2(157.0, 113.0) * p.y) + f.xz;
+    float2 rg = _NoiseTexture.SampleLevel(sampler_NoiseTexture, (uv + 0.5) / _NoiseTextureResolution, 0).yx;
+    return lerp(rg.x, rg.y, f.z);
+}
+
+
+// Maps hash into perlin like 3d noise, but cheaper
+// @ pos	- world space position
+// @ s		- sample count, minimum of 1.
+float MapHash3(float3 pos)
+{
+    float3 q = pos;
+    float f;
+
+    f = 0.50000 * TextureNoise(q);
+    q = q * 2.02;
+    f += 0.25000 * TextureNoise(q);
+    q = q * 2.03;
+    f += 0.12500 * TextureNoise(q);
+
+    return f;
+}
+
+// Noise function by Inigo Quilez - https://www.shadertoy.com/view/4sfGzS
+float noise(float3 x)
+{
+    x *= 4.0;
+    float3 p = floor(x);
+    float3 f = frac(x);
+    f = f * f * (3.0 - 2.0 * f);
+    float2 uv = (p.xy + float2(37.0, 17.0) * p.z) + f.xy;
+    float2 rg = _NoiseTexture.SampleLevel(sampler_NoiseTexture, (uv + 0.5) / _NoiseTextureResolution, 0).yx;
+    return lerp(rg.x, rg.y, f.z);
+}
+
+// Mapped noise function to generate clouds.
+float fbm(float3 pos, int octaves)
+{
+    float f = 0.;
+    for (int i = 0; i < octaves; i++)
+        f += ProceduralNoise(pos * _NoiseFrequency) / pow(2, i + 1);
+    pos *= 2.01;
+    f /= 1 - 1 / pow(2, octaves + 1);
+	
+    return f;
+}
+
+
+
+// ---------------------------------------------- Perlin Functions ----------------------------------------------------------- //
+
+float mod289(float x)
+{
+    return x - floor(x * NOISE_SIMPLEX_1_DIV_289) * 289.0;
+}
+
+float2 mod289(float2 x)
+{
+    return x - floor(x * NOISE_SIMPLEX_1_DIV_289) * 289.0;
+}
+
+float3 mod289(float3 x)
+{
+    return x - floor(x * NOISE_SIMPLEX_1_DIV_289) * 289.0;
+}
+
+float4 mod289(float4 x)
+{
+    return x - floor(x * NOISE_SIMPLEX_1_DIV_289) * 289.0;
+}
+
+
+// ( x*34.0 + 1.0 )*x = 
+// x*x*34.0 + x
+float permute(float x)
+{
+    return mod289(
+		x * x * 34.0 + x
+	);
+}
+
+float3 permute(float3 x)
+{
+    return mod289(
+		x * x * 34.0 + x
+	);
+}
+
+float4 permute(float4 x)
+{
+    return mod289(
+		x * x * 34.0 + x
+	);
+}
+
+
+// ----------------------------------- 3D -------------------------------------
+
+float snoise(float3 v)
+{
+    const float2 C = float2(
+		0.166666666666666667, // 1/6
+		0.333333333333333333 // 1/3
+	);
+    const float4 D = float4(0.0, 0.5, 1.0, 2.0);
+	
+// First corner
+    float3 i = floor(v + dot(v, C.yyy));
+    float3 x0 = v - i + dot(i, C.xxx);
+	
+// Other corners
+    float3 g = step(x0.yzx, x0.xyz);
+    float3 l = 1 - g;
+    float3 i1 = min(g.xyz, l.zxy);
+    float3 i2 = max(g.xyz, l.zxy);
+	
+    float3 x1 = x0 - i1 + C.xxx;
+    float3 x2 = x0 - i2 + C.yyy; // 2.0*C.x = 1/3 = C.y
+    float3 x3 = x0 - D.yyy; // -1.0+3.0*C.x = -0.5 = -D.y
+	
+// Permutations
+    i = mod289(i);
+    float4 p = permute(
+		permute(
+			permute(
+					i.z + float4(0.0, i1.z, i2.z, 1.0)
+			) + i.y + float4(0.0, i1.y, i2.y, 1.0)
+		) + i.x + float4(0.0, i1.x, i2.x, 1.0)
+	);
+	
+// Gradients: 7x7 points over a square, mapped onto an octahedron.
+// The ring size 17*17 = 289 is close to a multiple of 49 (49*6 = 294)
+    float n_ = 0.142857142857; // 1/7
+    float3 ns = n_ * D.wyz - D.xzx;
+	
+    float4 j = p - 49.0 * floor(p * ns.z * ns.z); // mod(p,7*7)
+	
+    float4 x_ = floor(j * ns.z);
+    float4 y_ = floor(j - 7.0 * x_); // mod(j,N)
+	
+    float4 x = x_ * ns.x + ns.yyyy;
+    float4 y = y_ * ns.x + ns.yyyy;
+    float4 h = 1.0 - abs(x) - abs(y);
+	
+    float4 b0 = float4(x.xy, y.xy);
+    float4 b1 = float4(x.zw, y.zw);
+	
+	//float4 s0 = float4(lessThan(b0,0.0))*2.0 - 1.0;
+	//float4 s1 = float4(lessThan(b1,0.0))*2.0 - 1.0;
+    float4 s0 = floor(b0) * 2.0 + 1.0;
+    float4 s1 = floor(b1) * 2.0 + 1.0;
+    float4 sh = -step(h, 0.0);
+	
+    float4 a0 = b0.xzyw + s0.xzyw * sh.xxyy;
+    float4 a1 = b1.xzyw + s1.xzyw * sh.zzww;
+	
+    float3 p0 = float3(a0.xy, h.x);
+    float3 p1 = float3(a0.zw, h.y);
+    float3 p2 = float3(a1.xy, h.z);
+    float3 p3 = float3(a1.zw, h.w);
+	
+//Normalise gradients
+    float4 norm = rsqrt(float4(
+		dot(p0, p0),
+		dot(p1, p1),
+		dot(p2, p2),
+		dot(p3, p3)
+	));
+    p0 *= norm.x;
+    p1 *= norm.y;
+    p2 *= norm.z;
+    p3 *= norm.w;
+	
+// Mix final noise value
+    float4 m = max(
+		0.6 - float4(
+			dot(x0, x0),
+			dot(x1, x1),
+			dot(x2, x2),
+			dot(x3, x3)
+		),
+		0.0
+	);
+    m = m * m;
+    return 42.0 * dot(
+		m * m,
+		float4(
+			dot(p0, x0),
+			dot(p1, x1),
+			dot(p2, x2),
+			dot(p3, x3)
+		)
+	);
+}
+
+
+
+
+// ---------------------------------------------- Core Functions ----------------------------------------------------------- //
+
+
+// Compute volume medium contribution
+// @ volumeStep - current depth slice
+float computeParticipatingMedium(float3 currentPos)
+{
+    float density   = 0.5f;
+
+    if (_EnableNoise)
+    {
+        switch (_NoiseType)
+        {
+            case 0:
+                density = fbm(currentPos, _NoiseOctaves);
+                if (density > 1.0f)
+                    density = 0; 
+                break;
+            case 1:
+                density = snoise(currentPos) * 2.0f;
+                break;
+        }
+
+        float invScale = (1.0f - _NoiseDensityScale);
+        density = saturate(density - invScale) / _NoiseDensityScale;
+    }
+
+    return density;
+}
+
+
+
+//
+//
+//
+[numthreads(4, 4, 4)]
+void Noise(uint3 id : SV_DispatchThreadID)
+{
+    // compute participating medium density.
+    float density = saturate(computeParticipatingMedium(id));
+
+    // store
+    _VolumeMediumMap[id] = density;
+/*
+
+    float opacityLeft   = 1.0f;
+    float opacityRight  = 1.0f;
+
+    float opacityUp     = 1.0f;
+    float opacityDown   = 1.0f;
+
+    for (int i = 0; i < 5; i++)
+    {
+        float left      = saturate(computeParticipatingMedium((float3) id + float3(-0.01, 0, 0) * i));
+        opacityLeft *= exp(-left);
+
+        float right     = saturate(computeParticipatingMedium((float3) id + float3(0.01, 0, 0) * i));
+        opacityRight *= exp(-right);
+
+        float up        = saturate(computeParticipatingMedium((float3) id + float3(0, 0.01, 0) * i));
+        opacityLeft *= exp(-up);
+
+        float down      = saturate(computeParticipatingMedium((float3) id + float3(0, -0.01, 0) * i));
+        opacityLeft *= exp(-down);
+    }
+
+    _NoiseOcclusionMap[id] = 1.0f - float4(opacityLeft, opacityRight, opacityUp, opacityDown);*/
+}  

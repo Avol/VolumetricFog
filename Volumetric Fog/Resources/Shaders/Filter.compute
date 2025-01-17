@@ -1,0 +1,30 @@
+﻿#pragma kernel VolumeFilter
+
+Texture3D<float4> 				_Read;
+RWTexture3D<float4> 			_Write;
+
+uniform float3 _VolumeResolution;
+
+float4 filter(uint3 id)
+{
+	float4 color = 0;
+
+    if (id.x != uint(_VolumeResolution.x) - 0.5f &&
+		id.y != uint(_VolumeResolution.y))
+	{
+        color += _Read[float3(id.x - 0.5f, id.y, id.z)]; // left
+        color += _Read[float3(clamp(id.x + 0.5f, 0, _VolumeResolution.x - 0.5f), id.y, id.z)]; // right
+        color += _Read[float3(id.x, clamp(id.y - 0.5f, 0, _VolumeResolution.y - 0.5f), id.z)]; // down
+        color += _Read[float3(id.x, clamp(id.y + 0.5f, 0, _VolumeResolution.y - 0.5f), id.z)]; // up
+        color *= 0.25f;
+    }
+     
+	return color;
+}
+
+[numthreads(8, 8, 1)]
+void VolumeFilter(uint3 id : SV_DispatchThreadID)
+{
+    for (int z = 0; z < _VolumeResolution.z; z++)
+		_Write[uint3(id.xy, z)] = filter(uint3(id.xy, z));
+}
